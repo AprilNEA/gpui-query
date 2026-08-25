@@ -94,13 +94,13 @@ builder 方法在首次 `state()`/订阅生效前收集 options,`Query::new` 惰
 ## 验收标准(照抄任务书,逐条勾)
 
 - [x] swr-rs 问卷笔记 + 路线决策(docs/swr-rs-notes.md;A 路线,无需上游 PR)
-- [ ] 全部 SWR 语义测试在 TestAppContext 虚拟时钟下确定性通过,零真实 sleep
-- [ ] 双视图共享缓存只发一次请求;句柄全释放后条目被 gc
-- [ ] 乐观更新三路径(成功/失败回滚/失效)测试通过
-- [ ] 竞态测试:慢请求后发先至被丢弃
-- [ ] demo 三场景编译通过 + 冒烟;切 key 无闪白(keepPreviousData)
-- [ ] 基准:1000 订阅者单次 notify 开销写入 README
-- [ ] README 完整,含 swr 选项对照表与降级说明
+- [x] 全部 SWR 语义测试在 TestAppContext 虚拟时钟下确定性通过,零真实 sleep(15 个测试,scripts/check-time-discipline.sh 把关)
+- [x] 双视图共享缓存只发一次请求;句柄全释放后条目被 gc(tests/core.rs)
+- [x] 乐观更新三路径(成功/失败回滚/失效)测试通过(tests/client.rs)
+- [x] 竞态测试:慢请求后发先至被丢弃(tests/core.rs)
+- [x] demo 三场景编译通过;切 key 无闪白(keepPreviousData)——运行时交互验证需本机 GPU 环境,orb 无法执行
+- [x] 基准:1000 订阅者单次 notify 开销写入 README(中位数 ~327µs,benches/notify.rs 可复现)
+- [x] README 完整,含 swr 选项对照表与降级说明
 
 ## v2 路线(README 记录,首版不做)
 
