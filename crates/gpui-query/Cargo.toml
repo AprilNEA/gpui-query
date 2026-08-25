@@ -12,6 +12,7 @@ gpui.workspace = true
 swr-core.workspace = true
 swr-gpui.workspace = true
 anyhow.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
