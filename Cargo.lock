@@ -2207,6 +2207,7 @@ name = "gpui-query"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "gpui",
  "swr-core",
  "swr-gpui",

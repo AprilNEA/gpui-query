@@ -39,11 +39,17 @@
 //! }
 //! ```
 
+use std::any::{Any, TypeId};
+use std::cell::RefCell;
 use std::future::Future;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{App, Context, Entity, Global, Task, Window};
+use futures::channel::mpsc::{self, UnboundedSender};
+use futures::{FutureExt as _, StreamExt as _};
+use gpui::{App, AppContext as _, Context, Entity, Global, Subscription, Task, Window};
 pub use swr_core::{
     Instant, IntoKeyPrefix, IntoQueryKey, IntoSegment, IntoSegments, MutateOptions, QueryKey,
     QueryOptions, ReadPolicy, Retry, RetryPolicy, SwrClient, SwrEvent,
@@ -73,12 +79,18 @@ impl Global for GlobalQueryClient {}
 #[derive(Clone)]
 pub struct QueryClient {
     inner: SwrClient,
+    online: Arc<AtomicBool>,
+    window_attachments: Rc<RefCell<Vec<Entity<WindowAttachment>>>>,
 }
 
 impl QueryClient {
     /// Wrap an existing [`SwrClient`] (advanced; most apps use [`init`]).
     pub fn new(inner: SwrClient) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            online: Arc::new(AtomicBool::new(true)),
+            window_attachments: Rc::new(RefCell::new(Vec::new())),
+        }
     }
 
     /// The underlying [`SwrClient`], for direct swr-core access.
@@ -129,8 +141,19 @@ impl QueryClient {
         E: Send + Sync + 'static,
         Fut: Future<Output = Result<Option<T>, E>> + Send + 'static,
     {
-        let _ = (key, optimistic, fut, cx);
-        todo!("wave 1 (Thread A): spawn inner.mutate on background executor")
+        let inner = self.inner.clone();
+        cx.background_executor().spawn(async move {
+            inner
+                .mutate(
+                    key,
+                    MutateOptions {
+                        optimistic,
+                        ..MutateOptions::default()
+                    },
+                    fut,
+                )
+                .await
+        })
     }
 
     /// Manually signal "the app regained focus" — revalidates stale entries
@@ -144,17 +167,38 @@ impl QueryClient {
     /// [`SwrEvent::Online`], revalidating stale entries that opted into
     /// `revalidate_on_online`.
     pub fn set_online(&self, online: bool) {
-        let _ = online;
-        todo!("wave 1 (Thread A): track transition, broadcast Online on reconnect")
+        let was_online = self.online.swap(online, Ordering::AcqRel);
+        if online && !was_online {
+            self.inner.broadcast(SwrEvent::Online);
+        }
     }
+}
+
+struct WindowAttachment {
+    _subscription: Option<Subscription>,
 }
 
 /// Wire window activation to focus revalidation: on activation the client
 /// broadcasts [`SwrEvent::Focus`] (per-entry `focus_throttle` applies).
 /// Call once per window, e.g. inside `cx.open_window(...)`.
 pub fn attach_window(window: &mut Window, cx: &mut App) {
-    let _ = (window, cx);
-    todo!("wave 1 (Thread A): internal entity + observe_window_activation")
+    let query_client = client(cx);
+    let focus_client = query_client.clone();
+    let attachment = cx.new(|_| WindowAttachment {
+        _subscription: None,
+    });
+    attachment.update(cx, |attachment, cx| {
+        attachment._subscription =
+            Some(cx.observe_window_activation(window, move |_, window, _| {
+                if window.is_window_active() {
+                    focus_client.on_focus();
+                }
+            }));
+    });
+    query_client
+        .window_attachments
+        .borrow_mut()
+        .push(attachment);
 }
 
 /// What a view sees when it reads a query. Cheap to produce (Arc clones).
@@ -193,6 +237,16 @@ pub enum QueryState<T, E = anyhow::Error> {
 pub struct Query<T: 'static, E: 'static = anyhow::Error> {
     mirror: Entity<Mirror<T, E>>,
     _watcher: Task<()>,
+    client: swr_core::WeakSwrClient,
+    runtime: Arc<dyn swr_core::Runtime>,
+    key: QueryKey,
+    key_type: TypeId,
+    key_value: ErasedKey,
+    fetcher: Arc<ErasedQueryFetcher<T, E>>,
+    opts: QueryOptions,
+    retry_policy: Option<RetryPolicy>,
+    keep_previous_data: bool,
+    replacement_tx: UnboundedSender<WatchCommand<T, E>>,
 }
 
 /// Mirror entity state: latest core snapshot plus binding-layer extras
@@ -200,12 +254,19 @@ pub struct Query<T: 'static, E: 'static = anyhow::Error> {
 /// Opaque to users; observe it via [`Query::entity`], read via
 /// [`Query::state`].
 pub struct Mirror<T: 'static, E: 'static> {
-    #[allow(dead_code)] // wave 1 (Thread A)
     state: swr_core::QueryState<T, E>,
-    #[allow(dead_code)]
     previous_data: Option<Arc<T>>,
-    #[allow(dead_code)]
     keep_previous_data: bool,
+}
+
+type ErasedKey = Arc<dyn Any + Send + Sync>;
+type ErasedQueryFetcher<T, E> =
+    dyn Fn(ErasedKey) -> swr_core::BoxedFuture<Result<T, E>> + Send + Sync;
+
+struct WatchCommand<T: 'static, E: 'static> {
+    handle: swr_core::QueryHandle<T, E>,
+    keep_previous_data: bool,
+    key_changed: bool,
 }
 
 impl<T, E> Query<T, E>
@@ -226,53 +287,143 @@ where
         F: Fn(K) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<T, E>> + Send + 'static,
     {
-        let _ = (key, fetcher, cx);
-        todo!("wave 1 (Thread A): subscribe_eq + mirror entity + watcher + auto-observe")
+        let query_client = client(cx);
+        let runtime: Arc<dyn swr_core::Runtime> = Arc::new(GpuiRuntime::new(cx));
+        let query_key = key.clone().into_query_key();
+        let key_value: ErasedKey = Arc::new(key);
+        let fetcher = Arc::new(fetcher);
+        let erased_fetcher: Arc<ErasedQueryFetcher<T, E>> = Arc::new(move |key| {
+            let key = Arc::downcast::<K>(key)
+                .expect("Query::set_key requires the same key type used by Query::new");
+            Box::pin(fetcher((*key).clone()))
+        });
+        let opts = QueryOptions::default();
+        let handle = subscribe_handle(
+            &query_client.inner,
+            &runtime,
+            &query_key,
+            &key_value,
+            &erased_fetcher,
+            &opts,
+            None,
+        );
+        let initial_state = handle.snapshot();
+        let mirror = cx.new(|_| Mirror {
+            state: initial_state,
+            previous_data: None,
+            keep_previous_data: false,
+        });
+        let weak_mirror = mirror.downgrade();
+        let (replacement_tx, mut replacement_rx) = mpsc::unbounded::<WatchCommand<T, E>>();
+        let watcher = cx.spawn(async move |_, cx| {
+            let mut handle = handle;
+            loop {
+                enum WatchEvent<T: 'static, E: 'static> {
+                    Changed(Result<(), swr_core::Closed>),
+                    Replace(Option<WatchCommand<T, E>>),
+                }
+
+                let event = {
+                    let changed = handle.changed().fuse();
+                    let replacement = replacement_rx.next().fuse();
+                    futures::pin_mut!(changed, replacement);
+                    futures::select_biased! {
+                        replacement = replacement => WatchEvent::Replace(replacement),
+                        changed = changed => WatchEvent::Changed(changed),
+                    }
+                };
+
+                let (snapshot, keep_previous_data, key_changed) = match event {
+                    WatchEvent::Changed(Ok(())) => (handle.snapshot(), None, false),
+                    WatchEvent::Changed(Err(_)) | WatchEvent::Replace(None) => break,
+                    WatchEvent::Replace(Some(command)) => {
+                        handle = command.handle;
+                        (
+                            handle.snapshot(),
+                            Some(command.keep_previous_data),
+                            command.key_changed,
+                        )
+                    }
+                };
+
+                let updated = weak_mirror.update(cx, |mirror, cx| {
+                    if apply_snapshot(mirror, snapshot, keep_previous_data, key_changed) {
+                        cx.notify();
+                    }
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        });
+        cx.observe(&mirror, |_, _, cx| cx.notify()).detach();
+
+        Self {
+            mirror,
+            _watcher: watcher,
+            client: query_client.inner.downgrade(),
+            runtime,
+            key: query_key,
+            key_type: TypeId::of::<K>(),
+            key_value,
+            fetcher: erased_fetcher,
+            opts,
+            retry_policy: None,
+            keep_previous_data: false,
+            replacement_tx,
+        }
     }
 
     /// Freshness window (absorbs SWR's `dedupingInterval`). Default: 2s.
-    pub fn stale_time(self, duration: Duration) -> Self {
-        let _ = duration;
-        todo!("wave 1 (Thread A): update opts, resubscribe via watcher channel")
+    pub fn stale_time(mut self, duration: Duration) -> Self {
+        self.opts.stale_time = duration;
+        self.resubscribe(false);
+        self
     }
 
     /// Idle-entry GC delay after the last subscriber drops. Default: 300s.
-    pub fn gc_time(self, duration: Duration) -> Self {
-        let _ = duration;
-        todo!("wave 1 (Thread A)")
+    pub fn gc_time(mut self, duration: Duration) -> Self {
+        self.opts.gc_time = duration;
+        self.resubscribe(false);
+        self
     }
 
     /// Background refresh interval while subscribed. Default: off.
-    pub fn refresh_interval(self, duration: Duration) -> Self {
-        let _ = duration;
-        todo!("wave 1 (Thread A)")
+    pub fn refresh_interval(mut self, duration: Duration) -> Self {
+        self.opts.refresh_interval = Some(duration);
+        self.resubscribe(false);
+        self
     }
 
     /// Revalidate stale data when the window regains focus (requires
     /// [`attach_window`] or manual [`QueryClient::on_focus`]). Default: true.
-    pub fn revalidate_on_focus(self, enabled: bool) -> Self {
-        let _ = enabled;
-        todo!("wave 1 (Thread A)")
+    pub fn revalidate_on_focus(mut self, enabled: bool) -> Self {
+        self.opts.revalidate_on_focus = enabled;
+        self.resubscribe(false);
+        self
     }
 
     /// Revalidate stale data when connectivity returns
     /// ([`QueryClient::set_online`]). Default: true.
-    pub fn revalidate_on_online(self, enabled: bool) -> Self {
-        let _ = enabled;
-        todo!("wave 1 (Thread A)")
+    pub fn revalidate_on_online(mut self, enabled: bool) -> Self {
+        self.opts.revalidate_on_online = enabled;
+        self.resubscribe(false);
+        self
     }
 
     /// Retry failed fetches with exponential backoff (swr-core `Retry`).
-    pub fn retry(self, policy: RetryPolicy) -> Self {
-        let _ = policy;
-        todo!("wave 1 (Thread A)")
+    pub fn retry(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = Some(policy);
+        self.resubscribe(false);
+        self
     }
 
     /// Keep showing the previous key's data while the new key loads
     /// (no flash of Loading when paginating). Default: false.
-    pub fn keep_previous_data(self, enabled: bool) -> Self {
-        let _ = enabled;
-        todo!("wave 1 (Thread A): binding-layer previous_data in Mirror")
+    pub fn keep_previous_data(mut self, enabled: bool) -> Self {
+        self.keep_previous_data = enabled;
+        self.resubscribe(false);
+        self
     }
 
     /// Switch to a new key (same key type), e.g. next page. With
@@ -282,16 +433,42 @@ where
     where
         K: IntoQueryKey<T, E> + Clone + Send + Sync + 'static,
     {
-        let _ = key;
-        todo!("wave 1 (Thread A): resubscribe, swap handle via watcher channel")
+        assert_eq!(
+            TypeId::of::<K>(),
+            self.key_type,
+            "Query::set_key requires the same key type used by Query::new"
+        );
+        self.key = key.clone().into_query_key();
+        self.key_value = Arc::new(key);
+        self.resubscribe(true);
     }
 
     /// Read the current state. Pure read: never triggers fetches, safe in
     /// render. Revalidation is driven by subscription lifecycle, staleness
     /// timers, focus/online events and invalidation — not by reads.
     pub fn state(&self, cx: &App) -> QueryState<T, E> {
-        let _ = cx;
-        todo!("wave 1 (Thread A): map mirror -> Loading/Ready/Error (+previous_data)")
+        let mirror = self.mirror.read(cx);
+        if let Some(error) = &mirror.state.error {
+            QueryState::Error {
+                error: Arc::clone(error),
+                stale_data: mirror.state.data.clone(),
+            }
+        } else if let Some(data) = &mirror.state.data {
+            QueryState::Ready {
+                data: Arc::clone(data),
+                is_validating: mirror.state.is_validating,
+            }
+        } else if mirror.keep_previous_data {
+            match &mirror.previous_data {
+                Some(data) => QueryState::Ready {
+                    data: Arc::clone(data),
+                    is_validating: true,
+                },
+                None => QueryState::Loading,
+            }
+        } else {
+            QueryState::Loading
+        }
     }
 
     /// The mirror entity, to `cx.observe(...)` from additional views.
@@ -301,6 +478,114 @@ where
 
     /// Request a revalidation now (deduplicated against in-flight fetches).
     pub fn refetch(&self) {
-        todo!("wave 1 (Thread A): client.revalidate_key")
+        if let Some(client) = self.client.upgrade() {
+            client.revalidate_key(self.key.clone());
+        }
+    }
+
+    fn resubscribe(&mut self, key_changed: bool) {
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        let handle = subscribe_handle(
+            &client,
+            &self.runtime,
+            &self.key,
+            &self.key_value,
+            &self.fetcher,
+            &self.opts,
+            self.retry_policy.clone(),
+        );
+        self.replacement_tx
+            .unbounded_send(WatchCommand {
+                handle,
+                keep_previous_data: self.keep_previous_data,
+                key_changed,
+            })
+            .expect("query watcher lives as long as its replacement sender");
+    }
+}
+
+fn subscribe_handle<T, E>(
+    client: &SwrClient,
+    runtime: &Arc<dyn swr_core::Runtime>,
+    key: &QueryKey,
+    key_value: &ErasedKey,
+    fetcher: &Arc<ErasedQueryFetcher<T, E>>,
+    opts: &QueryOptions,
+    retry_policy: Option<RetryPolicy>,
+) -> swr_core::QueryHandle<T, E>
+where
+    T: PartialEq + Send + Sync + 'static,
+    E: Send + Sync + 'static,
+{
+    let segments = key.segments().to_vec();
+    let key_value = Arc::clone(key_value);
+    let fetcher = Arc::clone(fetcher);
+    let fetch = move |_segments: Vec<swr_core::Segment>| fetcher(Arc::clone(&key_value));
+    match retry_policy {
+        Some(policy) => client.subscribe_eq(
+            segments,
+            Retry::new(Arc::clone(runtime), fetch, policy),
+            opts.clone(),
+        ),
+        None => client.subscribe_eq(segments, fetch, opts.clone()),
+    }
+}
+
+fn apply_snapshot<T, E>(
+    mirror: &mut Mirror<T, E>,
+    snapshot: swr_core::QueryState<T, E>,
+    keep_previous_data: Option<bool>,
+    key_changed: bool,
+) -> bool {
+    let old_previous_data = mirror.previous_data.clone();
+    let old_keep_previous_data = mirror.keep_previous_data;
+
+    if key_changed {
+        mirror.previous_data = keep_previous_data
+            .filter(|enabled| *enabled)
+            .and_then(|_| mirror.state.data.clone().or(mirror.previous_data.clone()));
+    }
+    if snapshot.data.is_some() {
+        mirror.previous_data = None;
+    }
+    if let Some(enabled) = keep_previous_data {
+        mirror.keep_previous_data = enabled;
+    }
+
+    let changed = !same_state(&mirror.state, &snapshot)
+        || !same_optional_arc(&old_previous_data, &mirror.previous_data)
+        || old_keep_previous_data != mirror.keep_previous_data;
+    mirror.state = snapshot;
+    changed
+}
+
+fn same_state<T, E>(left: &swr_core::QueryState<T, E>, right: &swr_core::QueryState<T, E>) -> bool {
+    let same_values =
+        same_optional_arc(&left.data, &right.data) && same_optional_arc(&left.error, &right.error);
+    if !same_values {
+        return false;
+    }
+
+    if left.is_loading == right.is_loading && left.is_validating == right.is_validating {
+        return true;
+    }
+
+    // subscribe_eq preserves the Arc when a revalidation commits equal data.
+    // The mirror still records validation completion, but its observers need
+    // not rebuild for a payload whose identity did not change.
+    left.data.is_some()
+        && left.is_validating
+        && !right.is_validating
+        && !left.is_loading
+        && !right.is_loading
+}
+
+fn same_optional_arc<T>(left: &Option<Arc<T>>, right: &Option<Arc<T>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
     }
 }
