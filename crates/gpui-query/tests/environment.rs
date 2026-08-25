@@ -85,9 +85,13 @@ async fn focus_throttle_builder_overrides_default_interval(cx: &mut TestAppConte
 
     let _view = cx.update(|cx| {
         cx.new(|cx| QueryView {
-            query: Query::new(("focus-throttled",), counter_fetcher(Arc::clone(&calls)), cx)
-                .stale_time(Duration::ZERO)
-                .focus_throttle(Duration::from_secs(1)),
+            query: Query::new(
+                ("focus-throttled",),
+                counter_fetcher(Arc::clone(&calls)),
+                cx,
+            )
+            .stale_time(Duration::ZERO)
+            .focus_throttle(Duration::from_secs(1)),
         })
     });
     cx.run_until_parked();
