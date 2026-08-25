@@ -562,10 +562,24 @@ fn apply_snapshot<T, E>(
 }
 
 fn same_state<T, E>(left: &swr_core::QueryState<T, E>, right: &swr_core::QueryState<T, E>) -> bool {
-    same_optional_arc(&left.data, &right.data)
-        && same_optional_arc(&left.error, &right.error)
-        && left.is_loading == right.is_loading
-        && left.is_validating == right.is_validating
+    let same_values =
+        same_optional_arc(&left.data, &right.data) && same_optional_arc(&left.error, &right.error);
+    if !same_values {
+        return false;
+    }
+
+    if left.is_loading == right.is_loading && left.is_validating == right.is_validating {
+        return true;
+    }
+
+    // subscribe_eq preserves the Arc when a revalidation commits equal data.
+    // The mirror still records validation completion, but its observers need
+    // not rebuild for a payload whose identity did not change.
+    left.data.is_some()
+        && left.is_validating
+        && !right.is_validating
+        && !left.is_loading
+        && !right.is_loading
 }
 
 fn same_optional_arc<T>(left: &Option<Arc<T>>, right: &Option<Arc<T>>) -> bool {
