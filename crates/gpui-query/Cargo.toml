@@ -1,0 +1,17 @@
+[package]
+name = "gpui-query"
+description = "Async data layer for gpui: declarative fetching with stale-while-revalidate caching, powered by swr-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gpui.workspace = true
+swr-core.workspace = true
+swr-gpui.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
