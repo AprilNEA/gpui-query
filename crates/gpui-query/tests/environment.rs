@@ -78,6 +78,44 @@ async fn focus_revalidates_stale_entries_with_throttle_and_opt_out(cx: &mut Test
 }
 
 #[gpui::test]
+async fn focus_throttle_builder_overrides_default_interval(cx: &mut TestAppContext) {
+    cx.update(gpui_query::init);
+    let query_client = cx.update(|cx| gpui_query::client(cx));
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let _view = cx.update(|cx| {
+        cx.new(|cx| QueryView {
+            query: Query::new(("focus-throttled",), counter_fetcher(Arc::clone(&calls)), cx)
+                .stale_time(Duration::ZERO)
+                .focus_throttle(Duration::from_secs(1)),
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    query_client.on_focus();
+    cx.run_until_parked();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    query_client.on_focus();
+    cx.run_until_parked();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "second focus inside the custom one-second throttle is ignored"
+    );
+
+    cx.executor().advance_clock(Duration::from_secs(1));
+    query_client.on_focus();
+    cx.run_until_parked();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "focus after the custom throttle window revalidates again"
+    );
+}
+
+#[gpui::test]
 async fn online_only_broadcasts_on_false_to_true_transition(cx: &mut TestAppContext) {
     cx.update(gpui_query::init);
     let query_client = cx.update(|cx| gpui_query::client(cx));

@@ -403,6 +403,14 @@ where
         self
     }
 
+    /// Minimum spacing between focus-triggered revalidations (SWR's
+    /// `focusThrottleInterval`). Default: 5s.
+    pub fn focus_throttle(mut self, duration: Duration) -> Self {
+        self.opts.focus_throttle = duration;
+        self.resubscribe(false);
+        self
+    }
+
     /// Revalidate stale data when connectivity returns
     /// ([`QueryClient::set_online`]). Default: true.
     pub fn revalidate_on_online(mut self, enabled: bool) -> Self {

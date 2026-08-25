@@ -60,7 +60,7 @@ Rust `Duration` values.
 | `fetcher` | The second argument to `Query::new(key, fetcher, cx)` | Receives the full typed key and returns a `Send` future. |
 | `dedupingInterval` | `.stale_time(duration)` | There is no separate dedup timer. Concurrent requests are always single-flight; fresh cached data suppresses another fetch for `stale_time`, which defaults to 2s. |
 | `revalidateOnFocus` | `.revalidate_on_focus(bool)` plus `attach_window(window, cx)` | Defaults to `true`. Call `attach_window` once for each window, or signal focus manually with `client(cx).on_focus()`. |
-| `focusThrottleInterval` | Core-level `QueryOptions::focus_throttle` | Defaults to 5s. The high-level `Query` currently has no `focus_throttle` builder; custom values require the advanced `client(cx).inner()` / swr-core subscription API. |
+| `focusThrottleInterval` | `.focus_throttle(duration)` | Defaults to 5s. |
 | `revalidateOnReconnect` | `.revalidate_on_online(bool)` plus `client(cx).set_online(bool)` | Defaults to `true`; only a `false` → `true` transition broadcasts the online event. |
 | `refreshInterval` | `.refresh_interval(duration)` | Defaults to off. The timer runs while the entry is subscribed. |
 | `errorRetryCount`, `errorRetryInterval` | `.retry(RetryPolicy { max_retries, interval })` | Retry is opt-in on `Query`. `RetryPolicy::default()` is 3 retries with a 5s base interval and exponential backoff. |
