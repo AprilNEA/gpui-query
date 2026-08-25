@@ -16,3 +16,7 @@ futures.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+
+[[bench]]
+name = "notify"
+harness = false
